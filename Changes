@@ -1,5 +1,10 @@
 Revision history for Perl extension Parallel::ForkControl.
 
+0.02  Fri Jan  9 19:18:19 EST 2004
+	- Updated documentation.
+	- Added a test suite that actually tests the module.
+	- Fixed a bug with process creation
+
 0.01  Wed Nov 12 16:07:28 2003
 	- original version; created by h2xs 1.22 with options
 		-AX -n Parallel::ForkControl

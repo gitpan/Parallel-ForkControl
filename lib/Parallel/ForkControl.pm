@@ -10,7 +10,7 @@ use strict;
 use POSIX qw/:signal_h :errno_h :sys_wait_h/;
 
 our $AUTOLOAD;
-our $VERSION = 0.01;
+our $VERSION = 0.02;
 
 use constant TRUE => 1;
 use constant FALSE => 0;
@@ -46,7 +46,7 @@ use constant DB_HIGH	=> 4;
 		'_parentpid'		=> [ $$,			'get/set'	],
 		'_code'			=> [ undef,			'init/get/set'	],
 		'_debug'		=> [ DB_OFF,			'init/get/set'	],
-		'_check_at'		=> [ 50,			PERMIT_ALL 	],
+		'_check_at'		=> [ 2,			PERMIT_ALL 	],
 		'_checked'		=> [ 0,				'get/init'	]
 	);
 	
@@ -87,6 +87,8 @@ use constant DB_HIGH	=> 4;
 	sub _kidstopped {
 		# keep track
 		my ($self,$kid) = @_;
+		$self->_dbmsg(DB_HIGH, "KIDSTOPPED: $kid");
+		$self->_dbmsg(DB_HIGH, "KIDS: $_KIDS, (" . join(',',keys %_KIDS) . ")");
 		return unless exists $_KIDS{$kid};
 		$self->_dbmsg(DB_LOW,"CHILD: $kid ENDING");
 		delete $_KIDS{$kid};
@@ -95,9 +97,10 @@ use constant DB_HIGH	=> 4;
 	sub kids {
 		return wantarray() ? keys %_KIDS : $_KIDS;
 	}
-	sub kids_time_hash {
-		my %hash = %_KIDS;
-		return \%hash;
+	sub kid_time {
+		my ($self,$kid) = @_;
+		return time unless exists $_KIDS{$kid};
+		return $_KIDS{$kid};
 	}
 	sub _pid {
 		return $$;
@@ -107,6 +110,8 @@ use constant DB_HIGH	=> 4;
 # Class Methods
 sub DESTROY {
 	# load this into the symbol table immediately!
+	my $self = shift;
+	$self->cleanup();
 }
 
 sub new {
@@ -155,10 +160,10 @@ sub _overLoad {
 	my ($self) = shift;
 	return FALSE unless $self->get_watchload();
 	open(LOAD, "$CMDTOCHECK |") or return FALSE;
-	local $_ = <LOAD>;
+	local $/ = undef;
+	chomp(local $_ = <LOAD>);
 	close LOAD;
-	chomp;
-	if(/load average\:\s+(\d+\.\d+)/) {
+	if(/load average\:\s+(\d+\.\d+)/m) {
 		my $current = $1;
 		my $MAXLOAD = $self->get_maxload();
 		if ($current >= $MAXLOAD) {
@@ -231,7 +236,13 @@ sub _check {
 	return if $self->get_check_at > $self->get_checked;
 	foreach my $pid ( $self->kids ) {
 		my $alive = kill 0, $pid;
-		next if $alive;
+		if($alive) {
+			my $start = $self->kid_time($pid);
+			if(time - $start > $self->get_processtimeout()) {
+				kill 9, $pid;
+			}
+		}
+	
 		$self->_dbmsg(DB_INFO, "Child ($pid) evaded the reaper. Caught by _check()\n");
 		$self->_kidstopped($pid);
 	}
@@ -244,38 +255,58 @@ sub run {
 	my ($self,@args) = @_;
 	my $ref = ref $self->get_code;
 	die "CANNOT RUN A $ref IN RUN()\n" unless $ref eq 'CODE';
+
 	# return if our parent has died
 	unless($self->_parentAlive()) {
 		$self->_dbmsg(DB_MED, 'PARENT IS NOT ALIVE: ' . $self->get_parentpid);
 		return;
 	}
+
+	# We might call _check();
+	$self->_check();
+
 	# wait for childern to die if we have too many
 	if($self->get_method =~ /block/) {
 		$self->cleanup() if $self->_tooManyKids;
 	}
-	else {
-		$self->_kidstopped(wait) if $self->_tooManyKids;
+	elsif($self->_tooManyKids) {
+		$self->_kidstopped(wait);
 	}
+	else {
+		#
+		# I have to throttle process creation for some reason
+		# with this in here, we shouldn't be able to produce more
+		# than 8 processes per second.  Its reasonable, but there
+		# has to be a better way to deal with this.
+		select undef, undef, undef, 0.1;
+	}
+
 	# Protect us from zombies
 	$SIG{'CHLD'} =  sub { $self->_REAPER };
+
+	# fork();
 	my $pid = fork();
 	# check for errors
 	die "*\n* FORK ERROR !!\n*\n" unless defined $pid;
+
 	# if we're the parent return
 	if($pid > 0) {
+		select undef, undef, undef, 0.01;
 		return $self->_kidstarted($pid);
 	}
+
 	# we're the child, run and exit
 	local $0 = '[ ' . $self->get_name . ' ]';
 	$self->_dbmsg(DB_HIGH,'Running Fork Code');
 	eval {
-		local $SIG{ALRM} = sub { die "timeout"; };
-		alarm $self->get_processtimeout if $self->get_processtimeout;
+		#local $SIG{ALRM} = sub { die "timeout"; };
+		#alarm $self->get_processtimeout if $self->get_processtimeout;
 		$self->get_code()->(@args);
 	};
 	alarm 0;
 	$self->_dbmsg(DB_LOW, "Child $$ timed out!") if $@ =~ /timeout/;
-	exit $@ ? 1 : 0;
+	my $CODE = $@ ? 1 : 0;
+	exit $CODE;
 }
 
 sub cleanup {
@@ -299,16 +330,13 @@ sub _REAPER {
 	my $pid = waitpid(-1, &WNOHANG);
 	if($pid > 0) {
 		# a pid did something,
-		if(WIFEXITED($?)) {
-			# the pid exited
-			$self->_kidstopped($pid);
-		}
-		else {
+		$self->_dbmsg(DB_HIGH,"Reaper found a child ($pid)!!!!!");
+		if(!WIFEXITED($?)) {
 			$self->_dbmsg(DB_INFO, "Child ($pid) exitted abnormally");
-			$self->_kidstopped($pid);
 		}
+		$self->_kidstopped($pid);
 	}
-	$SIG{'CHLD'} =  sub { $self->_REAPER };
+	$SIG{'CHLD'} =  sub {$self->_REAPER};
 }
 
 sub _parentAlive {
@@ -408,7 +436,7 @@ fork object.  Any parameters passed to the run() method will be passed to the
 subroutine ref defined as the 'Code' arg.  This allows a developer to spend
 less time worrying about the underlying fork() system, and just write code.
 
-=head1 INTERFACE
+=head1 METHODS
 
 =over 4
 
@@ -420,23 +448,116 @@ mutators allow such behavior, even while the B<run()> method is being executed.
 
 =over 4
 
-=item options
+=item Options
 
-Name
-ProcessTimeOut
-MaxKids
-MinKids
-MaxLoad
-*MaxMem (unimplemented)
-*MaxCPU (unimplemented)
-Method
-WatchCount
-WatchLoad
-*WatchMem (unimplemented)
-*WatchCPU (unimplemented)
-Code
-Check_At
-Debug
+=over 4
+
+=item Name
+
+Process Name that will show up in a 'ps', mostly cosmetic, but serves as an
+easy way to distinguish children and parent in a ps.
+
+=item ProcessTimeOut
+
+The max time any given process is allowed to run before its interrupted.
+B<Default :>120 seconds
+
+=item WatchCount
+
+Enforce count (MaxKids) restraints on new processes.
+B<Default :> 1
+
+=item WatchLoad
+
+Enforce load based (MaxLoad) restraints on process creation. NOTE: This MUST be
+a true value to enable throttling based on Load Averages.
+B<Default :> 0
+
+=item WatchMem ***
+
+(unimplemented)
+
+=item WatchCPU ***
+
+(unimplemented)
+
+=item Method
+
+May be 'block' or 'cycle'.  Block will fork off MaxKids and wait for all of them
+to die, then fork off MaxKids more processes.  Cycle will continually replace
+processes as the restraints allow.  Cycle is almost ALWAYS the preferred method.
+B<Default :>Cycle
+B
+
+=item MaxKids
+
+The maximum number of children that may be running at any given time.
+B<Default :> 5
+
+=item MinKids
+
+The minimum number of kids to keep running regardless of load/memory/CPU
+throttling.
+B<Default :> 1
+
+=item MaxLoad
+
+The maximum one minute average load.  Make sure to set WatchLoad.
+B<Default :> 4.50 (off by default)
+
+=item MaxMem  *** 
+
+(unimplemented)
+
+=item MaxCPU ***
+
+(unimplemented)
+
+=item Code
+
+This should be a subroutine reference.  If you intend on passing arguments to this
+subroutine arguments it is imperative that you B<NOT> include () in the reference.
+All code inside the subroutine will be run in the child process.  The module provides
+all the necessary checks and safety nets, so your subroutine may just "return".  It is
+not necessary, nor is it good practice to have exit()s in this subroutine as eventually,
+return codes will be stored and made available to the parent process after completion.
+Examples:
+
+	my $code = sub {
+			# do something useful
+			my $t = shift;
+			return $t;
+	};
+
+	my $forker = new Parallel::ForkControl(
+				Name => 'me',
+				MaxKids => 10,
+				Code => $code
+				# or
+				#Code => \&mysub
+	)
+
+	sub mysub {
+		my $t = shift;
+		return $t;
+	}
+
+=item Check_At
+
+This determines between how many child processes the module does some checking
+to verify the validity of its internal process table.  It shouldn't be necessary 
+to modify this value, but given it is a little low, someone only utilizing this
+module for a larger number of data sets might want to check things at larger
+intervals.
+B<Default :> 2
+
+=item Debug
+
+A number 0-4. The higher the number, the more debugging information you'll see.
+0 means nothing.
+B<Default :> 0
+
+=back
 
 =back
 
@@ -461,6 +582,20 @@ This method blocks until all children have finished processing.
 =head1 EXPORT
 
 None by default.
+
+=head1 KNOWN ISSUES
+
+=item 01/08/2004 - brad@divisionbyzero.net
+
+=over 4
+
+For some reason, I'm having to throttle process creation, as a slew of  processes
+starting and ending at the same time seems to be causing problems on my machine.
+I've adjust the Check_At down to 2 which seems to catch any processes whose SIG{CHLD}
+gets lost in the mess of spawning.  I'm looking into a more permanent, professional
+solution.
+
+=back
 
 =head1 SEE ALSO
 
