@@ -1,0 +1,6 @@
+Revision history for Perl extension Parallel::ForkControl.
+
+0.01  Wed Nov 12 16:07:28 2003
+	- original version; created by h2xs 1.22 with options
+		-AX -n Parallel::ForkControl
+

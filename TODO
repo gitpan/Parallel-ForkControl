@@ -1,0 +1,4 @@
+12/08/03 - brad@divisionbyzero.net
+	- Better tests
+	- Better documentation
+	- Move to Factory model to utilize OS specific process monitoring

@@ -1,0 +1,7 @@
+Changes
+lib/Parallel/ForkControl.pm
+Makefile.PL
+MANIFEST
+README
+TODO
+t/Parallel_ForkControl.t
