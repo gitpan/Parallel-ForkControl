@@ -1,5 +1,10 @@
 Revision history for Perl extension Parallel::ForkControl.
 
+0.03 Sun Oct  1 21:30 EST 2006
+	- Kwalitee Improvements
+	- Process accounting started.
+	- Perl Best Practices rewrite start.
+
 0.02  Fri Jan  9 19:18:19 EST 2004
 	- Updated documentation.
 	- Added a test suite that actually tests the module.

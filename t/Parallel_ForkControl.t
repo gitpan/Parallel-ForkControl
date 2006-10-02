@@ -48,7 +48,7 @@ if( !defined $obj ) {
 #
 # list of all public and private methods
 #
-can_ok($obj, qw/_attributes _default _can _kidstarted _kidstopped kids kid_time _pid new _overLoad _tooManyKids _check run cleanup _REAPER _parentAlive print_me _dbmsg/);
+can_ok($obj, qw/_attributes _default _can _kidstarted _kidstopped kids kid_time _pid new _overLoad _tooManyKids _check run cleanup _REAPER _parentAlive _print_me _dbmsg/);
 
 # ====> !!!! DO NOT ERASE THIS LINE !!!! <==== #
 
@@ -68,7 +68,8 @@ $obj = new Parallel::ForkControl(
 		MaxLoad		=> 3.50,
 		MaxKids		=> 10,
 		ProcessTimeout => 5,
-		Code		=> sub { my $n = shift; select undef, undef, undef, $n; },
+		Accounting	=> 1,
+		Code		=> sub { my $n = shift; print "$$ - $n\n"; sleep $n; },
 		Debug		=> 0
 );
 
@@ -77,7 +78,7 @@ isa_ok( $obj, 'Parallel::ForkControl' );
 my $FORKS = 15;
 
 while($FORKS--) {
-	my $t = $FORKS % 2 ? 1.50 : 2.25;
+	my $t = $FORKS % 2 ? 2 : 3;
 	ok($obj->run($t), "run");
 }
 ok($obj->cleanup(), "cleanup");

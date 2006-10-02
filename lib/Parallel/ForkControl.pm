@@ -7,10 +7,13 @@
 #
 package Parallel::ForkControl;
 use strict;
+use warnings;
+
 use POSIX qw/:signal_h :errno_h :sys_wait_h/;
+use Storable qw(freeze thaw);
 
 our $AUTOLOAD;
-our $VERSION = 0.02;
+our $VERSION = 0.03;
 
 use constant TRUE => 1;
 use constant FALSE => 0;
@@ -30,24 +33,27 @@ use constant DB_HIGH	=> 4;
 {
  # private data members
 	my %_attributes = (
-		# Name			     # defaults			# permissions
-		'_name'			=> [ 'Unnamed Child',		PERMIT_ALL	],
-		'_processtimeout'	=> [ 120,			PERMIT_ALL	],
-		'_maxkids'		=> [ 5,				PERMIT_ALL	],
-		'_minkids'		=> [ 1,				PERMIT_ALL	],
-		'_maxload'		=> [ 4.50,			PERMIT_ALL	],
-		'_maxmem'		=> [ 10.0,			PERMIT_ALL	],	# non functional
-		'_maxcpu'		=> [ 25.0,			PERMIT_ALL	],
-		'_method'		=> [ 'cycle',			PERMIT_ALL	],
-		'_watchcount'		=> [ TRUE,			PERMIT_ALL	],
-		'_watchload'		=> [ FALSE,			PERMIT_ALL	],
-		'_watchmem'		=> [ FALSE,			PERMIT_ALL	],	# non functional
-		'_watchcpu'		=> [ FALSE,			PERMIT_ALL	],	# non functional
-		'_parentpid'		=> [ $$,			'get/set'	],
-		'_code'			=> [ undef,			'init/get/set'	],
-		'_debug'		=> [ DB_OFF,			'init/get/set'	],
-		'_check_at'		=> [ 2,			PERMIT_ALL 	],
-		'_checked'		=> [ 0,				'get/init'	]
+		# Name			     # defaults				# permissions
+		'_name'				=> [ 'Unnamed Child',	PERMIT_ALL	],
+		'_processtimeout'	=> [ 120,				PERMIT_ALL	],
+		'_maxkids'			=> [ 5,					PERMIT_ALL	],
+		'_minkids'			=> [ 1,					PERMIT_ALL	],
+		'_maxload'			=> [ 4.50,				PERMIT_ALL	],
+		'_maxmem'			=> [ 10.0,				PERMIT_ALL	],	# non functional
+		'_maxcpu'			=> [ 25.0,				PERMIT_ALL	],
+		'_method'			=> [ 'cycle',			PERMIT_ALL	],
+		'_watchcount'		=> [ TRUE,				PERMIT_ALL	],
+		'_watchload'		=> [ FALSE,				PERMIT_ALL	],
+		'_watchmem'			=> [ FALSE,				PERMIT_ALL	],	# non functional
+		'_watchcpu'			=> [ FALSE,				PERMIT_ALL	],	# non functional
+		'_parentpid'		=> [ $$,				'get/set'	],
+		'_code'				=> [ undef,				'init/get/set'	],
+		'_debug'			=> [ DB_OFF,			'init/get/set'	],
+		'_check_at'			=> [ 2,					PERMIT_ALL 	],
+		'_checked'			=> [ 0,					'get/init'	],
+		'_accounting'		=> [ FALSE,				PERMIT_ALL	],
+		'_results'			=> [ undef,				'get'		],
+		'_trackargs'		=> [ FALSE,				PERMIT_ALL	]
 	);
 	
 	my %_KIDS=();
@@ -77,19 +83,39 @@ use constant DB_HIGH	=> 4;
 	}
 	sub _kidstarted {
 		# keep records of our children
-		my ($self,$kid) = @_;
+		my ($self,$kid,@args) = @_;
 		$self->_dbmsg(DB_LOW,"CHILD: $kid STARTING");
 		#
 		# use time() here to implement the process time out
 		$_KIDS{$kid} = time;
-		return ++$_KIDS;
+
+		$self->{_results}{$kid} = {
+			status		=> 'running',
+			signature	=> undef,
+			result		=> undef,
+			exitcode	=> undef,
+			error		=> undef
+		} if $self->get_accounting();
+
+		$self->_kid_signature($kid,@args);
+		#
+		# increment the KIDS cntr.
+		$_KIDS++;
+
+		#
+		# return the pid!
+		return $kid;
 	}
 	sub _kidstopped {
 		# keep track
-		my ($self,$kid) = @_;
+		my ($self,$kid,$err) = @_;
 		$self->_dbmsg(DB_HIGH, "KIDSTOPPED: $kid");
 		$self->_dbmsg(DB_HIGH, "KIDS: $_KIDS, (" . join(',',keys %_KIDS) . ")");
 		return unless exists $_KIDS{$kid};
+		if($self->get_accounting()) {
+			$self->{_results}{$kid}{status} = 'terminated';
+			$self->_kid_err($kid,$err) if defined $err;
+		}
 		$self->_dbmsg(DB_LOW,"CHILD: $kid ENDING");
 		delete $_KIDS{$kid};
 		return --$_KIDS;
@@ -105,12 +131,44 @@ use constant DB_HIGH	=> 4;
 	sub _pid {
 		return $$;
 	}
+
+	#
+	# Child Accounting
+	sub _kid_err {
+		my ($self,$kid,$err) = @_;
+		return unless $self->get_accounting();
+		push @{ $self->{_results}{$kid}{error} }, $err;
+	}
+	sub _kid_exitcode {
+		my ($self,$kid,$ec) = @_;
+		return unless $self->get_accounting();
+		$self->{_results}{$kid}{exitcode} = $ec;
+	}
+	sub _kid_result {
+		my ($self,$kid,$result) = @_;
+		return unless $self->get_accounting();
+		$self->{_results}{$kid}{result} = $result;
+	}
+	sub _kid_signature {
+		my ($self,$kid,@args) = @_;
+		return unless $self->get_accounting();
+		$self->{_results}{$kid}{signature} = freeze \@args;
+	}
+	sub _kid_status {
+		my ($self,$kid) = @_;
+		return unless $self->get_accounting();
+		foreach my $err ( @{ $self->{_results}{$kid}{error} } ) {
+			$self->_dbmsg(DB_HIGH, "ChildError: $kid -> $err");
+		}
+	}
+
 }
 
 # Class Methods
 sub DESTROY {
 	# load this into the symbol table immediately!
 	my $self = shift;
+	return if $$ != $self->get_parentpid;
 	$self->cleanup();
 }
 
@@ -239,12 +297,15 @@ sub _check {
 		if($alive) {
 			my $start = $self->kid_time($pid);
 			if(time - $start > $self->get_processtimeout()) {
-				kill 9, $pid;
+				$self->_kid_err($pid,'process timeout');
+				kill 15, $pid;
+				$self->_kid_status($pid);
 			}
 		}
-	
-		$self->_dbmsg(DB_INFO, "Child ($pid) evaded the reaper. Caught by _check()\n");
-		$self->_kidstopped($pid);
+		else {
+			$self->_dbmsg(DB_INFO, "Child ($pid) evaded the reaper. Caught by _check()\n");
+			$self->_kidstopped($pid,'evaded the reaper');
+		}
 	}
 	$self->{_checked} = 0;
 }
@@ -254,7 +315,7 @@ sub run {
 	# the code ref isn't set
 	my ($self,@args) = @_;
 	my $ref = ref $self->get_code;
-	die "CANNOT RUN A $ref IN RUN()\n" unless $ref eq 'CODE';
+	die "CANNOT RUN A $ref IN run()\n" unless $ref eq 'CODE';
 
 	# return if our parent has died
 	unless($self->_parentAlive()) {
@@ -274,15 +335,14 @@ sub run {
 	}
 	else {
 		#
-		# I have to throttle process creation for some reason
-		# with this in here, we shouldn't be able to produce more
-		# than 8 processes per second.  Its reasonable, but there
-		# has to be a better way to deal with this.
-		select undef, undef, undef, 0.1;
+		# Due limitations with the speed of process creation
+		# on various modern OS's, its best to limit the maximum number
+		# of processes created per second to 100
+		select undef, undef, undef, 0.01;
 	}
 
 	# Protect us from zombies
-	$SIG{'CHLD'} =  sub { $self->_REAPER };
+	$SIG{CHLD} =  sub { $self->_REAPER };
 
 	# fork();
 	my $pid = fork();
@@ -291,21 +351,24 @@ sub run {
 
 	# if we're the parent return
 	if($pid > 0) {
-		select undef, undef, undef, 0.01;
-		return $self->_kidstarted($pid);
+		return $self->_kidstarted($pid,@args);
 	}
 
-	# we're the child, run and exit
-	local $0 = '[ ' . $self->get_name . ' ]';
+	# we're the child
+	local $0 = ' Child of ' . $self->get_name;
 	$self->_dbmsg(DB_HIGH,'Running Fork Code');
+	my @trapSignals = qw(INT KILL TERM QUIT HUP ABRT);
 	eval {
-		#local $SIG{ALRM} = sub { die "timeout"; };
-		#alarm $self->get_processtimeout if $self->get_processtimeout;
+		foreach my $sig (@trapSignals) {
+			$SIG{$sig} = sub { $self->_REAPER; };
+		}
 		$self->get_code()->(@args);
 	};
-	alarm 0;
-	$self->_dbmsg(DB_LOW, "Child $$ timed out!") if $@ =~ /timeout/;
-	my $CODE = $@ ? 1 : 0;
+	my $eval_error = $@;
+	if($eval_error =~ /timeout/) {
+		$self->_kid_err($$, 'alarmed out');
+	}
+	my $CODE = $eval_error ? 1 : 0;
 	exit $CODE;
 }
 
@@ -319,6 +382,7 @@ sub cleanup {
 	while( $self->kids ) {
 		$self->_check;
 		select undef, undef, undef, 1;
+		$self->_REAPER;
 	}
 	return TRUE;
 }
@@ -326,17 +390,30 @@ sub cleanup {
 sub _REAPER {
 	# our SIGCHLD Handler
 	# Code from the Perl Cookbook page 592
+	# - heavily modified
 	my $self = shift;
-	my $pid = waitpid(-1, &WNOHANG);
+
+	my $pid = wait;
+
 	if($pid > 0) {
 		# a pid did something,
-		$self->_dbmsg(DB_HIGH,"Reaper found a child ($pid)!!!!!");
+		$self->_dbmsg(DB_HIGH,"_REAPER found a child ($pid)!!!!!");
+		my $rc = undef;
 		if(!WIFEXITED($?)) {
+			$rc=1;
 			$self->_dbmsg(DB_INFO, "Child ($pid) exitted abnormally");
+			$self->_kid_err($pid,'abnormal process termination');
 		}
+		elsif( WIFSIGNALED($?) ) {
+			$self->_kid_err($pid,"Uncaught signal: " . WTERMSIG($?));
+		}
+		if(not defined $rc) {
+			$rc = WEXITSTATUS($?);
+		}
+		$self->_kid_exitcode($rc);
 		$self->_kidstopped($pid);
 	}
-	$SIG{'CHLD'} =  sub {$self->_REAPER};
+	$SIG{CHLD} =  sub {$self->_REAPER};
 }
 
 sub _parentAlive {
@@ -375,7 +452,7 @@ sub AUTOLOAD {
 }
 
 # DEBUG AND TESTING SUBS
-sub print_me {
+sub _print_me {
 	my $self = shift;
 	my $class = ref $self;
 	print "$class Object:\n";
@@ -416,7 +493,7 @@ Parallel::ForkControl - Finer grained control of processes on a Unix System
 				MaxKids			=> 50,
 				MinKids			=> 5,
 				WatchLoad		=> 1,
-				MaxLoad			=> 8.00
+				MaxLoad			=> 8.00,
 				Name			=> 'My Forker',
 				Code			=> \&mysub
 	);
@@ -520,7 +597,7 @@ subroutine arguments it is imperative that you B<NOT> include () in the referenc
 All code inside the subroutine will be run in the child process.  The module provides
 all the necessary checks and safety nets, so your subroutine may just "return".  It is
 not necessary, nor is it good practice to have exit()s in this subroutine as eventually,
-return codes will be stored and made available to the parent process after completion.
+return codes are stored and made available to the parent process after completion.
 Examples:
 
 	my $code = sub {
@@ -541,6 +618,20 @@ Examples:
 		my $t = shift;
 		return $t;
 	}
+
+=item Accounting
+
+By default this is turned off.  If you would like to keep track of the exit codes, sub routine
+return values, and current status of the children forked by the B<run()> routine, enable this
+option:
+
+	Accounting	=> 1
+
+=item TrackArgs
+
+By setting this to a true value, the fork controller will keep track of the arguments
+passed to each of the children.  Using this you can see what arguments yielded which results.
+This argument truly only makes sense if you've enabled the Accounting option.
 
 =item Check_At
 
@@ -568,7 +659,7 @@ handles process throttling, creation, monitoring, and reaping.  The subroutine
 in the I<Code> option run in the child process and all control is returned to the
 parent object as soon as the child is successfully created. B<run()> will block
 until it is allowed to create a process or process creation fails completely.
-B<run()> returns the number of kids on success, or undef on failure.  B<NOTE:> This
+B<run()> returns the PID of the child on success, or undef on failure.  B<NOTE:> This
 is not the return code of your subroutine.  I will eventually provide mapping
 to argument sets passed to run() with success/failure options and (idea) a
 "Report" option to enable some form of reporting based on that API.
@@ -576,6 +667,15 @@ to argument sets passed to run() with success/failure options and (idea) a
 =item B<cleanup()>
 
 This method blocks until all children have finished processing.
+
+=item B<kids()>
+
+This method returns the PIDs of all the children still alive in array context.
+In scalar context it returns the number of children still running.
+
+=item B<kid_time( $PID )>
+
+This method returns the start time in epoch seconds that the PID began.
 
 =back
 
@@ -585,9 +685,9 @@ None by default.
 
 =head1 KNOWN ISSUES
 
-=item 01/08/2004 - brad@divisionbyzero.net
-
 =over 4
+
+=item 01/08/2004 - brad@divisionbyzero.net
 
 For some reason, I'm having to throttle process creation, as a slew of  processes
 starting and ending at the same time seems to be causing problems on my machine.
@@ -615,5 +715,5 @@ Copyright 2003 by Brad Lhotsky
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself. 
-
+ 
 =cut
