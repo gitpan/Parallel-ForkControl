@@ -13,7 +13,7 @@ use POSIX qw/:signal_h :errno_h :sys_wait_h/;
 use Storable qw(freeze thaw);
 
 our $AUTOLOAD;
-our $VERSION = 0.03;
+our $VERSION = 0.04;
 
 use constant TRUE => 1;
 use constant FALSE => 0;
@@ -241,21 +241,9 @@ sub _tooManyKids {
 	my $kids = $self->kids;
 	my $MAXKIDS = $self->get_maxkids();
 	my $MINKIDS = $self->get_minkids();
-	unless(	$self->get_watchload() ||
-		$self->get_watchmem() ||
-		$self->get_watchcpu()
-	) {
-		# not watching the load, stick to the
-		# maxforks attribute
-		$self->_dbmsg(DB_LOW,"TOOMANYKIDS - NOT CHECKING LOAD/MEM/CPU - Kids: $kids MAX: $MAXKIDS");
-		if($kids >= $self->get_maxkids()) {
-			$self->_dbmsg(DB_MED,'TOOMANYKIDS - RETURN TRUE');
-			return TRUE;
-		} else {
-			$self->_dbmsg(DB_MED,'TOOMANYKIDS - RETURN FALSE');
-			return FALSE;
-		}
-	}
+
+	#
+	# Figure out how to do this check.
 	if($self->get_watchload) {
 		$self->_dbmsg(DB_MED,'TOOMANYKIDS - LOAD CHECKING');
 		if($self->get_watchcount) {
@@ -280,6 +268,18 @@ sub _tooManyKids {
 			return TRUE;
 		}
 	} # end of watchload
+	else {
+		# not watching the load, stick to the
+		# maxforks attribute
+		$self->_dbmsg(DB_LOW,"TOOMANYKIDS - NOT CHECKING LOAD/MEM/CPU - Kids: $kids MAX: $MAXKIDS");
+		if($kids >= $self->get_maxkids()) {
+			$self->_dbmsg(DB_MED,'TOOMANYKIDS - RETURN TRUE');
+			return TRUE;
+		} else {
+			$self->_dbmsg(DB_MED,'TOOMANYKIDS - RETURN FALSE');
+			return FALSE;
+		}
+	}
 
 	# if we get to this point something is wrong, return true
 	return TRUE;
