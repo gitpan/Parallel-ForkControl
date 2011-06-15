@@ -11,9 +11,11 @@ use warnings;
 
 use POSIX qw/:signal_h :errno_h :sys_wait_h/;
 use Storable qw(freeze thaw);
+use Try::Tiny;
+use CHI;
 
 our $AUTOLOAD;
-our $VERSION = 0.04;
+our $VERSION = 0.5;
 
 use constant TRUE => 1;
 use constant FALSE => 0;
@@ -134,6 +136,42 @@ use constant DB_HIGH	=> 4;
 
 	#
 	# Child Accounting
+	sub clear_results {
+		my ($self) = @_;
+		return unless $self->get_accounting();
+		delete $self->{_results} if exists $self->{_results};
+		$self->{_chi}->clear();
+	}
+
+	# Always return copies
+	sub get_results { 
+		my ($self,$key) = @_;
+		return unless $self->get_accounting();
+		if( !exists $self->{_results} ) {
+			warn "something successfully did not happen\n";
+			return;
+		}
+		if( defined $key ) {
+			if( $self->{_results}{$key} ) {
+				return { 
+						%{ $self->{_results}{$key} },
+						'return' => $self->{_chi}->get($key),
+				};
+			}
+			else {
+				warn "attempt to access undefined child '$key'\n";
+				return;
+			}
+		}
+		else {
+			my %local_copy = %{ $self->{_results} };
+			foreach my $kid ( keys %local_copy ) {
+				$local_copy{$kid}->{return} = $self->{_chi}->get( $kid );
+			}
+			return \%local_copy;
+		}
+	}
+
 	sub _kid_err {
 		my ($self,$kid,$err) = @_;
 		return unless $self->get_accounting();
@@ -144,14 +182,14 @@ use constant DB_HIGH	=> 4;
 		return unless $self->get_accounting();
 		$self->{_results}{$kid}{exitcode} = $ec;
 	}
-	sub _kid_result {
-		my ($self,$kid,$result) = @_;
+	sub _kid_return {
+		my ($self,$kid,$return) = @_;
 		return unless $self->get_accounting();
-		$self->{_results}{$kid}{result} = $result;
+		$self->{_chi}->set( $kid, $return, 'never' );
 	}
 	sub _kid_signature {
 		my ($self,$kid,@args) = @_;
-		return unless $self->get_accounting();
+		return unless $self->get_accounting() && $self->get_trackargs();
 		$self->{_results}{$kid}{signature} = freeze \@args;
 	}
 	sub _kid_status {
@@ -165,12 +203,7 @@ use constant DB_HIGH	=> 4;
 }
 
 # Class Methods
-sub DESTROY {
-	# load this into the symbol table immediately!
-	my $self = shift;
-	return if $$ != $self->get_parentpid;
-	$self->cleanup();
-}
+sub DESTROY { }
 
 sub new {
 	# Constructor
@@ -207,6 +240,9 @@ sub new {
 	# set the parent pid
 	$self->set_parentpid($$);
 	$self->_dbmsg(DB_HIGH,'FORK OBJECT CREATED');
+
+	# Create the Cache
+	$self->{_chi} = CHI->new( driver => 'File', root_dir => '/tmp', namespace => "PFC-$$" );
 	return $self;
 }
 
@@ -314,8 +350,21 @@ sub run {
 	# self and args go in, run the code ref or die if
 	# the code ref isn't set
 	my ($self,@args) = @_;
-	my $ref = ref $self->get_code;
-	die "CANNOT RUN A $ref IN run()\n" unless $ref eq 'CODE';
+
+	#
+	# Allow a user to pass a CODE Ref as the first argument,
+	# default to legacy CODE Parameter.
+	my $codeRef = shift @args;
+
+	#
+	# If it's not a code ref, put it back on args and get the code ref.
+	if( ref $codeRef ne 'CODE' ) {
+		unshift @args, $codeRef;
+		$codeRef = $self->get_code();
+	}
+
+	my $typeCodeRef = ref $codeRef;	
+	die "CANNOT RUN A $typeCodeRef IN run()\n" unless $typeCodeRef eq 'CODE';
 
 	# return if our parent has died
 	unless($self->_parentAlive()) {
@@ -328,7 +377,7 @@ sub run {
 
 	# wait for childern to die if we have too many
 	if($self->get_method =~ /block/) {
-		$self->cleanup() if $self->_tooManyKids;
+		$self->waitforkids() if $self->_tooManyKids;
 	}
 	elsif($self->_tooManyKids) {
 		$self->_kidstopped(wait);
@@ -358,21 +407,27 @@ sub run {
 	local $0 = ' Child of ' . $self->get_name;
 	$self->_dbmsg(DB_HIGH,'Running Fork Code');
 	my @trapSignals = qw(INT KILL TERM QUIT HUP ABRT);
-	eval {
+	my @return = ();
+	my $eval_error = undef;
+	try {
 		foreach my $sig (@trapSignals) {
 			$SIG{$sig} = sub { $self->_REAPER; };
 		}
-		$self->get_code()->(@args);
+		@return = $codeRef->(@args);
+	} catch {
+		$eval_error = shift;
+		if($eval_error =~ /timeout/) {
+			$self->_kid_err($$, 'alarmed out');
+		}
 	};
-	my $eval_error = $@;
-	if($eval_error =~ /timeout/) {
-		$self->_kid_err($$, 'alarmed out');
-	}
+	$self->_kid_return( $$, scalar @return > 1 ? \@return : shift @return );
+
 	my $CODE = $eval_error ? 1 : 0;
 	exit $CODE;
 }
 
-sub cleanup {
+
+sub waitforkids {
 	# We'll just rely on our SIG{'CHLD'} handler to actually
 	# disperse of the children, so all we have to do is wait
 	# here.
@@ -385,6 +440,11 @@ sub cleanup {
 		$self->_REAPER;
 	}
 	return TRUE;
+}
+# Provided for legacy support
+sub cleanup {
+	my $self = shift;
+	return $self->waitforkids;
 }
 
 sub _REAPER {
@@ -410,7 +470,7 @@ sub _REAPER {
 		if(not defined $rc) {
 			$rc = WEXITSTATUS($?);
 		}
-		$self->_kid_exitcode($rc);
+		$self->_kid_exitcode($pid,$rc);
 		$self->_kidstopped($pid);
 	}
 	$SIG{CHLD} =  sub {$self->_REAPER};
@@ -498,11 +558,29 @@ Parallel::ForkControl - Finer grained control of processes on a Unix System
 				Code			=> \&mysub
 	);
   my @hosts = qw/host1 host2 host3 host5 host5/;
+
+  my $altSub = sub { my $t = shift; ... };
+
   foreach my $host (@hosts) {
-	$forker->run($host);
+	if( $host eq 'alternateHost' ) {
+		$forker->run( $altSub, $host );
+	}
+	else {
+		$forker->run($host);
+	}
   }
 
-  $forker->cleanup();  # wait for all children to finish;
+  $forker->waitforkids();  # wait for all children to finish;
+  
+  my $results = $forker->get_results();  # Get the Return Codes from Children
+	# $results = {
+	# 		'29786' => {	# Kid PID
+	#				'status' => 'string',
+	#				'exitcode' => int,
+	#				'return' => $scalarCopyofReturnValue,
+	#				'signature' => $scalarFreezeOfArguments,
+	#		}, ...
+  $forker->clear_results();              # Reset the Results Tracker
   .....
 
 =head1 DESCRIPTION
@@ -619,6 +697,8 @@ Examples:
 		return $t;
 	}
 
+Alternatively, you may pass the sub reference as the first argument of the B<run()> method.
+
 =item Accounting
 
 By default this is turned off.  If you would like to keep track of the exit codes, sub routine
@@ -664,9 +744,44 @@ is not the return code of your subroutine.  I will eventually provide mapping
 to argument sets passed to run() with success/failure options and (idea) a
 "Report" option to enable some form of reporting based on that API.
 
-=item B<cleanup()>
+=item B<waitforkids()>
 
 This method blocks until all children have finished processing.
+
+=item B<cleanup()>
+
+Alias for waitforkids(), provided for legacy applications
+
+=item B<get_results( [ $pid ])>
+
+This method returns a hash reference of the arguments and return codes of the children:
+
+	$hashref = {
+		'2975' =>  {	# PID of Child
+			exitcode => 0,
+			status => 'done',
+			signature => $FrozenScalar,
+			return => $ReferenceToReturnValue
+		},
+		....
+	};
+
+The $pid is optional, but if specified, will return:
+
+	$hashref = {
+		exitcode => 0,
+		status => 'done',
+		signature => $FrozenScalar,
+		return => $ReferenceToReturnValue
+	};
+
+Requires Accounting => 1 and optionally TrackArgs => 1
+
+
+
+=item B<clear_results()>
+
+This method clears the results hash.
 
 =item B<kids()>
 
